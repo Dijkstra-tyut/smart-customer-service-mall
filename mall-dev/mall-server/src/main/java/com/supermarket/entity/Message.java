@@ -26,6 +26,10 @@ public class Message {
     @TableField("content")
     private String content;
 
+    /** Publication author from the agent audit relation; existing chat schema stays intact. */
+    @TableField(exist = false)
+    private String origin;
+
     @TableField("create_time")
     private LocalDateTime createTime;
 }

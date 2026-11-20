@@ -48,6 +48,7 @@ export default defineConfig({
   server: {
     port: 3001,
     proxy: {
+      '/ws': { target: 'ws://localhost:8800', ws: true },
       '/portal-api': {
         target: 'http://localhost:8800',
         changeOrigin: true,

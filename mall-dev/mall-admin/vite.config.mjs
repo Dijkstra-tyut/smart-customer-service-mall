@@ -9,6 +9,7 @@ export default defineConfig({
     host: 'localhost',
     port: 3002,
     proxy: {
+      '/ws': { target: 'ws://localhost:8800', ws: true },
       '/admin-api': {
         target: 'http://localhost:8800',
         changeOrigin: true,

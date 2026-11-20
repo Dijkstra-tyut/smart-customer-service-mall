@@ -120,5 +120,12 @@ upload:
 mall:
   customer:
     url: ${MALL_CUSTOMER_URL:http://localhost:8000}
+    service-token: ${AGENT_SERVICE_TOKEN:}
+    token-ttl-seconds: ${AGENT_RUN_TOKEN_TTL_SECONDS:3600}
+    resume-lease-seconds: ${AGENT_RESUME_LEASE_SECONDS:300}
+    resume-poll-ms: ${AGENT_RESUME_POLL_MS:3000}
+  live:
+    # WebSocket 握手 Origin 白名单，逗号分隔；* 表示不限制（默认，依赖 token 鉴权）
+    allowed-origins: ${MALL_LIVE_ALLOWED_ORIGINS:*}
 
 

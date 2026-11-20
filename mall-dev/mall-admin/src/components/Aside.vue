@@ -35,6 +35,8 @@ const allMenus = [
   { name: '分类管理', path: '/category', icon: 'Grid', role: 1 },
   { name: '商品管理', path: '/product', icon: 'Goods', role: 1 },
   { name: '订单管理', path: '/order', icon: 'Document', role: 1 },
+  { name: '客服人工任务', path: '/customer', icon: 'ChatDotRound', role: 1 },
+  { name: '人工实时客服', path: '/customer/live', icon: 'ChatDotRound', role: 1 },
   { name: '秒杀管理', path: '/seckill', icon: 'Lightning', role: 1 }
 ]
 

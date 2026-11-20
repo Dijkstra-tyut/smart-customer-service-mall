@@ -20,7 +20,7 @@ function trimValues(obj) {
 
 request.interceptors.request.use(config => {
   config.headers['Content-Type'] = 'application/json;charset=utf-8'
-  if (config.data) config.data = trimValues(config.data)
+  if (config.data && !config.preserveWhitespace) config.data = trimValues(config.data)
   if (config.params) config.params = trimValues(config.params)
   return config
 }, error => {

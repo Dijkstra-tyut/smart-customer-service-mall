@@ -16,6 +16,9 @@ services:
       MYSQL_DATABASE: mall
     volumes:
       - ../../db/mall.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ../../db/migrations/20261110_customer_agent.sql:/docker-entrypoint-initdb.d/02-customer-agent.sql:ro
+      - ../../db/migrations/20261115_customer_memory.sql:/docker-entrypoint-initdb.d/03-customer-memory.sql:ro
+      - ../../db/migrations/20261113_cs_live_chat.sql:/docker-entrypoint-initdb.d/04-customer-live.sql:ro
       - mall-mysql-data:/var/lib/mysql
     command: ['mysqld', '--default-time-zone=+08:00']
     networks:

@@ -234,6 +234,7 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         }
     }
 
+    @Transactional
     public void cancel(Integer id) {
         Order order = getById(id);
         if (order == null) {
@@ -242,8 +243,13 @@ public class OrderServiceImpl extends ServiceImpl<OrderMapper, Order> implements
         if (order.getStatus() != OrderStatusEnum.PENDING_PAY) {
             throw new ServiceException(BusinessStatusEnum.ORDER_CANCEL_DENIED);
         }
-        order.setStatus(OrderStatusEnum.CANCELLED);
-        updateById(order);
+        // Only the request winning this transition may release inventory. A stale read
+        // in another HTTP request must not release the same inventory a second time.
+        boolean changed = lambdaUpdate().eq(Order::getId, id)
+                .eq(Order::getStatus, OrderStatusEnum.PENDING_PAY)
+                .set(Order::getStatus, OrderStatusEnum.CANCELLED)
+                .set(Order::getUpdateTime, LocalDateTime.now()).update();
+        if (!changed) throw new ServiceException(BusinessStatusEnum.ORDER_CANCEL_DENIED);
         // 释放锁定库存
         List<OrderItem> items = orderItemMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<OrderItem>()

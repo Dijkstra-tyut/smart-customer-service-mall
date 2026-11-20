@@ -1,6 +1,7 @@
 package com.supermarket.controller.portal;
 
 import cn.dev33.satoken.stp.StpUtil;
+import com.supermarket.agent.AgentRuntimeService;
 import com.supermarket.dto.Response;
 import com.supermarket.dto.ResponseDTO;
 import com.supermarket.entity.Message;
@@ -26,6 +27,38 @@ public class CustomerController {
 
     private final SessionService sessionService;
     private final MessageService messageService;
+    private final AgentRuntimeService agentRuntime;
+    private final com.supermarket.agent.AgentMemoryService memory;
+    private final com.supermarket.agent.CustomerInteractionService interaction;
+
+    @GetMapping("/{sessionId}/live")
+    public ResponseDTO<?> live(@PathVariable long sessionId) {
+        return Response.success(interaction.current(sessionId, StpUtil.getLoginIdAsInt()));
+    }
+
+    @PostMapping("/{sessionId}/handoff")
+    public ResponseDTO<?> handoff(@PathVariable long sessionId) {
+        return Response.success(interaction.handoff(sessionId, StpUtil.getLoginIdAsInt()));
+    }
+
+    @PostMapping("/{sessionId}/after-sales")
+    public ResponseDTO<?> afterSales(@PathVariable long sessionId, @RequestBody Map<String, Object> body) {
+        return Response.success(interaction.afterSales(sessionId, StpUtil.getLoginIdAsInt(), body));
+    }
+
+    @Operation(summary = "查看本人可追溯的用户资料及偏好")
+    @GetMapping("/memory")
+    public ResponseDTO<?> userMemory() {
+        return Response.success(memory.profile(StpUtil.getLoginIdAsInt()));
+    }
+
+    @Operation(summary = "游标分页读取本人完整历史消息")
+    @GetMapping("/{sessionId}/messages/page")
+    public ResponseDTO<?> messagePage(@PathVariable long sessionId,
+                                     @RequestParam(required=false) Long beforeId,
+                                     @RequestParam(defaultValue="20") int size) {
+        return Response.success(memory.messages(StpUtil.getLoginIdAsInt(), sessionId, beforeId, size, false));
+    }
 
     @Operation(summary = "获取当前用户的客服会话列表")
     @GetMapping
@@ -45,6 +78,7 @@ public class CustomerController {
     @DeleteMapping("/{id}")
     public ResponseDTO<Void> deleteSession(@PathVariable("id") Long id) {
         Integer userId = StpUtil.getLoginIdAsInt();
+        interaction.close(id, userId);
         sessionService.delete(id, userId);
         return Response.ok("删除会话成功");
     }
@@ -54,6 +88,16 @@ public class CustomerController {
     public ResponseDTO<List<Message>> listMessages(@PathVariable("sessionId") Long sessionId) {
         Integer userId = StpUtil.getLoginIdAsInt();
         return Response.success(messageService.listMessagesBySessionId(sessionId, userId));
+    }
+
+    @GetMapping("/{sessionId}/run")
+    public ResponseDTO<?> run(@PathVariable Long sessionId) {
+        return Response.success(agentRuntime.portalRun(sessionId, StpUtil.getLoginIdAsInt()));
+    }
+
+    @PostMapping("/{sessionId}/cancel")
+    public ResponseDTO<?> cancel(@PathVariable Long sessionId) {
+        return Response.success(agentRuntime.cancel(sessionId, StpUtil.getLoginIdAsInt()));
     }
 
     @Operation(summary = "发送消息并流式返回回复")
@@ -66,10 +110,6 @@ public class CustomerController {
         return messageService.chat(sessionId, message, userId)
                 .map(content -> ServerSentEvent.<String>builder()
                         .data(content)
-                        .build())
-                .concatWith(Flux.just(ServerSentEvent.<String>builder()
-                        .event("done")
-                        .data("[DONE]")
-                        .build()));
+                        .build());
     }
 }

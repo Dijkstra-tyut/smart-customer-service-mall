@@ -1,99 +1,43 @@
-# Dependencies
-node_modules/
-.pnpm-store/
-
-# Java build output
-target/
-*.class
-*.jar
-*.war
-
-# IDE
-.idea/
-*.iml
-
-# Logs
-*.log
-log/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Claude local settings
-.claude/
-
-# Test artifacts
-.playwright-mcp/
-.superpowers/
-test-results/
-playwright-report/
-
-# Env files with secrets
+# Local secrets and environments
 .env
 .env.local
 .env.*.local
+.venv/
+venv/
 
-# Project uploads & cache (runtime data)
-file/
-img/product/
-
-# Temp files (runtime artifacts)
-/tmp/
-
-# Deploy & build directories (not version controlled)
-docker/deploy/
-docker/build/
-
-# Documentation (not version controlled, except notes)
-docs/*
-!docs/note/
-docs/note/*
-!docs/note/*.md
-docs/note/CLAUDE.md
-
-# Knowledge graph cache
-.understand-anything/
-**/.understand-anything/
-
-# Root-level AI instructions (use .claude/ instead)
-CLAUDE.md
-
-# E2E test configs (local dev only)
-mall-admin/e2e/
-mall-admin/playwright.config.ts
-mall-portal/e2e/
-mall-portal/playwright.config.ts
-
-# Deploy artifacts
-*.tar.gz
-
-# Dist
+# Installed dependencies and build output
+node_modules/
+.pnpm-store/
+target/
 dist/
-
-# Planning files
-findings.md
-progress.md
-task_plan.md
-
-# Production config (contains real credentials, never commit)
-application-prod.yml
-**/application-prod.yml
-
-# All test files & benchmarks (local only, never commit)
-*test*
-*Test*
-**/src/test/
-**/e2e/
-**/playwright.config.*
-*benchmark*
-*Benchmark*
-*.jmx
-docs/test-reports/
-classpath.txt
-
-
+*.class
+*.jar
+*.war
 __pycache__/
+*.py[cod]
 
-# Git Bash crash dumps
-*.stackdump
+# Editor and local analysis state
+.idea/
+.serena/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Runtime data and logs
+log/
+*.log
+file/
+vector_store/
+tmp/
+test-results/
+playwright-report/
+
+# Non-runtime notes and source-data preparation
+docs/
+img/note/
+img/readme/
+db/build_catalog.py
+db/catalog.json
+
+# Local production secrets
+application-prod.yml

@@ -65,9 +65,9 @@
     </select>
 
     <select id="selectPageByKeyword" resultType="com.supermarket.entity.Product">
-        SELECT id, name, price, stock, category_id, detail
+        SELECT id, name, price, stock, category_id, detail, status
         FROM pms_product
-        WHERE is_deleted = 0
+        WHERE is_deleted = 0 AND status = 1
         AND name LIKE CONCAT('%', #{keyword}, '%')
         ORDER BY create_time DESC
     </select>

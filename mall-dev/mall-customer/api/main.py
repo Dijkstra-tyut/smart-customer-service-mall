@@ -1,213 +1,253 @@
-"""
-FastAPI入口 — 提供REST API + SSE流式响应
-"""
-
+"""商城 Agent 运行入口，Java 提供业务查询、人工审批及 MySQL 对话记忆。"""
 from __future__ import annotations
-
-import os
-import uuid
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
-
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
-from agents.supervisor import create_supervisor_graph
-from memory.working_memory import WorkingMemory
-from memory.short_term_memory import ShortTermMemory
-from memory.long_term_memory import LongTermMemory
-from mcp.mcp_server import MCPToolServer, create_default_tools
-from tracing.otel_config import init_tracer, AgentMetrics
-
-load_dotenv()
-
-
-working_memory = WorkingMemory()
-short_term_memory = ShortTermMemory()
-long_term_memory = LongTermMemory(index_path=os.getenv("FAISS_INDEX_PATH", "./vector_store/faiss_index"))
-mcp_server = create_default_tools(MCPToolServer())
-metrics = AgentMetrics()
-graph = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    global graph
-
-    init_tracer(
-        service_name=os.getenv("OTEL_SERVICE_NAME", "smart-cs-multi-agent"),
-        otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
-    )
-
-    # 短期记忆：Redis 持久化 Agent State，Redis 不可用时自动降级内存
-    await short_term_memory.setup()
-
-    graph = create_supervisor_graph(
-        working_memory=working_memory,
-        long_term_memory=long_term_memory,
-        checkpointer=short_term_memory.checkpointer,
-    )
-
-    long_term_memory.add_document(
-        content="我们的理财产品A年化收益率为3.5%-5.2%，投资期限为6个月至3年，最低投资金额10000元。注意：理财非存款，产品有风险，投资须谨慎。",
-        source="product_faq.md",
-    )
-    long_term_memory.add_document(
-        content="退款政策：用户在购买后7天内可申请无理由退款，超过7天需提供合理原因。退款将在3-5个工作日内原路退回。",
-        source="refund_policy.md",
-    )
-    long_term_memory.add_document(
-        content="开户流程：1.准备身份证原件 2.填写开户申请表 3.进行视频认证 4.设置交易密码 5.完成风险评估问卷。整个流程约需15-30分钟。",
-        source="account_guide.md",
-    )
-
-    yield
-
-    await short_term_memory.aclose()
-
-
-app = FastAPI(
-    title="智能客服多Agent系统",
-    description="基于LangGraph的Supervisor编排多Agent智能客服系统",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-class ChatRequest(BaseModel):
-    message: str
-    user_id: str = "anonymous"
-    session_id: str | None = None
-
-
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-    intent: str
-    compliance_passed: bool
-
 
 import asyncio
 import json
+import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
-    """主聊天接口 — SSE流式输出"""
-    if graph is None:
-        raise HTTPException(status_code=503, detail="系统初始化中")
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 
-    session_id = request.session_id or str(uuid.uuid4())
+from agents.business_tools import AGENT_TOOLS, TOOL_ARGUMENTS, TOOL_DESCRIPTIONS
+from agents.model_gateway import ModelGateway
+from agents.supervisor import LoopLimits, create_supervisor_graph
+from runtime.backend_client import BackendError, MallBackendClient, valid_service_token
+from runtime.checkpoints import CheckpointStore
+from runtime.foundation import FoundationBackend
+from runtime.service import ChatRequest, ResumeRequest, RunRequest, RunService
+from rag.models import BuildRequest, SearchRequest
 
-    async def event_generator():
-        from langchain_core.messages import AIMessage, HumanMessage
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+logger = logging.getLogger(__name__)
 
-        initial_state = {
-            "messages": [HumanMessage(content=request.message)],
-            "user_id": request.user_id,
-            "session_id": session_id,
-            "intent": "",
-            "compliance_passed": True,
-            "current_agent": "",
-            "retry_count": 0,
-        }
 
-        config = {"configurable": {"thread_id": session_id}}
+def error_status(error: BackendError) -> int:
+    if error.code in {"STALE_RUN", "RUN_BUSY", "INVALID_DECISION", "INVALID_CANCEL"}:
+        return 409
+    if error.code in {"IDENTITY_MISMATCH", "ACCESS_DENIED", "RUN_INACTIVE"}:
+        return 403
+    if error.code == "RUN_NOT_FOUND":
+        return 404
+    if error.code == "UNSAFE_REPLY":
+        return 422
+    return 503
 
+
+def create_app(*, runtime: RunService | None = None, service_token: str | None = None) -> FastAPI:
+    expected_token = service_token if service_token is not None else os.getenv("AGENT_SERVICE_TOKEN", "")
+
+    async def authorize(x_agent_service_token: str | None = Header(default=None)) -> None:
+        if not expected_token:
+            raise HTTPException(status_code=503, detail="未配置服务间访问凭证")
+        if not valid_service_token(x_agent_service_token, expected_token):
+            raise HTTPException(status_code=401, detail="服务身份校验失败")
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        backend = None
+        checkpoints = None
+        knowledge = None
+        if runtime is None:
+            from langchain_openai import ChatOpenAI
+            if not expected_token:
+                raise RuntimeError("必须配置 AGENT_SERVICE_TOKEN")
+            model_name = os.getenv("MODEL_NAME")
+            if not model_name:
+                raise RuntimeError("必须配置 MODEL_NAME")
+            if not os.getenv("OPENAI_API_KEY", "").strip():
+                raise RuntimeError("请在 mall-customer/.env 的 OPENAI_API_KEY 中填写模型服务的 API Key")
+            mode = os.getenv("AGENT_RUNTIME_MODE", "java")
+            if mode not in {"foundation", "java"}:
+                raise RuntimeError("AGENT_RUNTIME_MODE 仅支持 foundation 或 java")
+            # PostgreSQL 保存执行现场，初始化失败时直接停止启动。
+            checkpoints = CheckpointStore()
+            saver = await checkpoints.setup()
+            try:
+                backend = (MallBackendClient(os.getenv("MALL_BACKEND_URL", "http://localhost:8800"), expected_token)
+                           if mode == "java" else FoundationBackend())
+                model = ChatOpenAI(model=model_name, api_key=os.getenv("OPENAI_API_KEY"),
+                                   base_url=os.getenv("OPENAI_BASE_URL"), temperature=0,
+                                   timeout=float(os.getenv("MODEL_TIMEOUT_SECONDS", "60")), max_retries=1)
+                gateway = ModelGateway(model, timeout=float(os.getenv("MODEL_TIMEOUT_SECONDS", "60")))
+                if os.getenv("RAG_ENABLED", "false").lower() == "true":
+                    from rag.config import RAGConfig
+                    from rag.service import KnowledgeService
+                    knowledge = await KnowledgeService(RAGConfig.from_env()).setup()
+                    application.state.knowledge = knowledge
+                limits = LoopLimits(active_seconds=float(os.getenv("AGENT_ACTIVE_TIMEOUT_SECONDS", "180")))
+                graph = create_supervisor_graph(model=gateway, backend=backend, checkpointer=saver, limits=limits, knowledge=knowledge)
+                from memory.conversation import ConversationMemory
+                memory = ConversationMemory(gateway, backend) if mode == "java" and os.getenv("CONVERSATION_MEMORY_ENABLED", "true").lower() == "true" else None
+                application.state.runtime = RunService(graph, backend, memory=memory)
+            except BaseException:
+                if knowledge is not None:
+                    await knowledge.close()
+                if backend is not None:
+                    await backend.close()
+                await checkpoints.close()
+                raise
         try:
-            result = await graph.ainvoke(initial_state, config=config)
-            # 最终回复即 Agent State 中末尾的 AIMessage（子Agent草稿或合成节点兜底话术）
-            messages = result.get("messages") or []
-            last = messages[-1] if messages else None
-            final_response = (
-                last.content
-                if isinstance(last, AIMessage) and last.content
-                else "系统处理异常，请稍后重试"
-            )
-        except Exception as e:
-            final_response = f"处理失败: {str(e)}"
+            yield
+        finally:
+            jobs = list(application.state.jobs)
+            if jobs:
+                _, pending = await asyncio.wait(jobs, timeout=10)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+            if backend is not None:
+                await backend.close()
+            if knowledge is not None:
+                await knowledge.close()
+            if checkpoints is not None:
+                await checkpoints.close()
 
-        # 模拟打字机流式切块输出
-        chunk_size = 4
-        for i in range(0, len(final_response), chunk_size):
-            chunk = final_response[i:i + chunk_size]
-            payload = json.dumps({"content": chunk}, ensure_ascii=False)
-            yield f"data: {payload}\n\n"
-            await asyncio.sleep(0.03)
+    application = FastAPI(title="商城客服 Agent 运行服务",
+                          version="2.0.0",
+                          lifespan=lifespan,
+                          dependencies=[Depends(authorize)],
+                          docs_url=None,
+                          redoc_url=None,
+                          openapi_url=None)
+    application.state.runtime = runtime
+    application.state.jobs = set()
+    application.state.knowledge = None
 
-        yield "data: [DONE]\n\n"
+    def knowledge_for(request: Request):
+        value = request.app.state.knowledge
+        if value is None:
+            raise HTTPException(status_code=503, detail="知识库未启用，请配置 RAG_ENABLED 及外部服务")
+        return value
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
+    @application.post("/api/knowledge/build")
+    async def build_knowledge(body: BuildRequest, request: Request):
+        service = knowledge_for(request)
+        try:
+            return await service.build(body.source)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="知识库构建参数无效、文件不可用或正在构建") from None
+        except Exception:
+            raise HTTPException(status_code=503, detail="知识库构建失败，已生效版本保持可用，请检查解析和存储服务") from None
+
+    @application.post("/api/knowledge/search")
+    async def search_knowledge(body: SearchRequest, request: Request):
+        service = knowledge_for(request)
+        try:
+            return await service.search(body.query,body.k)
+        except Exception:
+            raise HTTPException(status_code=503, detail="知识库检索服务暂时不可用") from None
+
+    def runtime_for(request: Request) -> RunService:
+        value = request.app.state.runtime
+        if value is None:
+            raise HTTPException(status_code=503, detail="运行服务尚未初始化")
+        return value
+
+    @application.exception_handler(BackendError)
+    async def backend_error(request: Request, error: BackendError):
+        return JSONResponse(status_code=error_status(error), content={"code": error.code, "message": error.public_message})
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, error: RequestValidationError):
+        # 不把敏感字段的原始 input 回显给调用方或日志。
+        details = [{"loc": item["loc"], "type": item["type"], "msg": item["msg"]} for item in error.errors()]
+        return JSONResponse(status_code=422, content={"detail": details})
+
+    #ifespan 启动时需要连接数据库、初始化 checkpointer、构建 graph 等——这中间可能有几秒窗口。
+    #此时如果流量进来就会 503，所以健康检查能让编排器等就绪了再放量。
+    @application.get("/health")
+    async def health(request: Request):
+        return {"status": "ready" if request.app.state.runtime is not None else "initializing", "version": "2.0.0"}
+
+    @application.get("/api/tools")
+    async def tools(request: Request):
+        if not runtime_for(request).backend.business_enabled:
+            if request.app.state.knowledge is not None:
+                from agents.business_tools import BusinessTools
+                tools = BusinessTools(runtime_for(request).backend,request.app.state.knowledge)
+                return {"agents":{agent:tools.descriptions(agent) for agent in AGENT_TOOLS},"status":"ready"}
+            return {"agents": {agent: [] for agent in AGENT_TOOLS},
+                    "status": "disabled", "message": "基础模式未启用 Java 业务工具；知识检索需配置 RAG_ENABLED 和外部服务"}
+        return {"agents": {agent: [{"name": name, "description": TOOL_DESCRIPTIONS[name],
+                                    "parameters": TOOL_ARGUMENTS[name].model_json_schema()} for name in sorted(names)]
+                           for agent, names in AGENT_TOOLS.items()}}
+
+    #TODO 也可在这里进行鉴权
+    @application.post("/api/chat")
+    async def chat(body: ChatRequest, request: Request):
+        # 找到应用启动时创建的 runtime 实例，调用其 chat 方法处理请求。
+        service = runtime_for(request)
+        # 与 SSE 连接寿命分开：客户端离开不撤销已接受的业务运行和结果落库。
+        # 把 service.start(body) 交给后台任务去跑，返回给客户端一个 task对象。
+        task = asyncio.create_task(service.start(body))
+        application.state.jobs.add(task)
+
+        def finished(job):
+            application.state.jobs.discard(job)
+            if not job.cancelled() and job.exception() is not None:
+                logger.error("Agent 运行异常，运行编号=%s，类型=%s", body.run_id, type(job.exception()).__name__)
+
+        task.add_done_callback(finished)  #回调函数
+
+        async def events():
+            def event(payload: dict[str, Any]) -> str:
+                return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            yield event({"type": "status", "run_id": body.run_id, "status": "running", "content": "正在处理您的请求"})
+            try:
+                # Agent 完成后取得处理结果 等待返回结果
+                outcome = await asyncio.shield(task)
+                status = outcome["status"]
+                base = {key: outcome[key] for key in ("run_id", "status", "message_id", "human_task_id", "revision", "reason", "actions") if outcome.get(key) is not None}
+                if status == "waiting_human":
+                    yield event({"type": "interrupted", **base, "content": outcome.get("reply") or "已提交人工处理"})
+                elif status == "failed":
+                    yield event({"type": "error", **base, "content": outcome.get("reply") or "自动处理未能完成"})
+                elif outcome.get("reply"):
+                    yield event({"type": "message", **base, "content": outcome["reply"]})
+                yield event({"type": "done", "run_id": body.run_id, "status": status})
+            except BackendError as error:
+                yield event({"type": "error", "run_id": body.run_id, "status": "failed", "code": error.code, "content": error.public_message})
+                yield event({"type": "done", "run_id": body.run_id, "status": "failed"})
+            except Exception:
+                yield event({"type": "error", "run_id": body.run_id, "status": "failed", "code": "RUNTIME_UNAVAILABLE", "content": "处理暂时中断，执行现场已保留，请稍后重试。"})
+                yield event({"type": "done", "run_id": body.run_id, "status": "failed"})
+
+        return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @application.post("/api/runs/{run_id}/resume")
+    async def resume(run_id: str, body: ResumeRequest, request: Request):
+        if body.run_id != run_id:
+            raise HTTPException(status_code=409, detail="运行编号不一致")
+        return await runtime_for(request).resume(body)
+
+    @application.post("/api/runs/{run_id}/cancel")
+    async def cancel(run_id: str, body: RunRequest, request: Request):
+        if body.run_id != run_id:
+            raise HTTPException(status_code=409, detail="运行编号不一致")
+        return await runtime_for(request).cancel(body)
+
+    @application.get("/api/runs/{run_id}")
+    @application.get("/api/runs/{run_id}/status")
+    async def status(run_id: str, session_id: str, request: Request):
+        return await runtime_for(request).status(run_id, session_id)
+
+    return application
 
 
-@app.get("/api/history/{session_id}")
-async def get_history(session_id: str, last_n: int = 20):
-    """获取对话历史 — 读取 LangGraph Agent State（checkpointer）"""
-    if graph is None:
-        raise HTTPException(status_code=503, detail="系统初始化中")
-    history = await short_term_memory.get_history(graph, session_id, last_n=last_n)
-    return {"session_id": session_id, "messages": history}
-
-
-@app.get("/api/tools")
-async def list_tools():
-    """MCP工具发现接口"""
-    return {"tools": mcp_server.list_tools()}
-
-
-@app.post("/api/tools/call")
-async def call_tool(request: dict):
-    """MCP工具调用接口"""
-    result = await mcp_server.call_tool(
-        name=request.get("name", ""),
-        arguments=request.get("arguments", {}),
-    )
-    return {
-        "success": result.success,
-        "result": result.result,
-        "error": result.error,
-        "duration_ms": result.duration_ms,
-    }
-
-
-@app.get("/api/metrics")
-async def get_metrics():
-    """获取系统指标"""
-    return {
-        "agent_metrics": metrics.get_summary(),
-        "tool_call_log": mcp_server.get_call_log(last_n=20),
-    }
-
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "version": "1.0.0"}
-
+app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "api.main:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000")),
-        reload=False,
-    )
+    config = uvicorn.Config("api.main:app", host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")))
+    if os.name == "nt":
+        # 新版 Uvicorn 自己选择 loop_factory，会绕过全局 policy；显式创建兼容 Psycopg 的循环。
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            runner.run(uvicorn.Server(config).serve())
+    else:
+        uvicorn.Server(config).run()

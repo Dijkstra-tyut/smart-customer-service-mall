@@ -17,6 +17,8 @@ const routes = [
       { path: 'category', name: 'category', component: () => import('@/views/Category.vue') },
       { path: 'product', name: 'product', component: () => import('@/views/Product.vue') },
       { path: 'order', name: 'order', component: () => import('@/views/Order.vue') },
+      { path: 'customer', name: 'customer', component: () => import('@/views/CustomerTasks.vue'), meta: { adminOnly: true } },
+      { path: 'customer/live', name: 'customer-live', component: () => import('@/views/CustomerLive.vue'), meta: { adminOnly: true } },
       { path: 'seckill', name: 'seckill', component: () => import('@/views/seckill/Seckill.vue') }
     ]
   },
@@ -32,6 +34,10 @@ router.beforeEach((to, from, next) => {
   const userStore = useUserStore()
   if (to.name !== 'login' && !userStore.user) {
     next({ name: 'login' })
+    return
+  }
+  if (to.meta.adminOnly && Number(userStore.user?.role) !== 1) {
+    next({ name: 'home' })
     return
   }
   next()
